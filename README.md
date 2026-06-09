@@ -1,0 +1,1 @@
+# idiot_of_the_day_bot
