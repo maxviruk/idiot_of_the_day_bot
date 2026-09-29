@@ -15,7 +15,7 @@
 ## Вариант A. Локально / на своём компьютере (для проверки)
 Нужен установленный Docker Desktop.
 ```bash
-cp .env.example .env          # вписать BOT_TOKEN и BOT_USERNAME
+cp .env.example .env          # вписать BOT_TOKEN (BOT_USERNAME — по желанию)
 docker compose up -d --build  # собрать и запустить в фоне
 docker compose logs -f        # смотреть логи (Ctrl+C — выйти из логов, бот продолжит работать)
 ```
@@ -61,7 +61,7 @@ docker compose up -d
    Railway сам увидит `Dockerfile` и соберёт образ.
 3. В разделе **Variables** добавь переменные:
    - `BOT_TOKEN` — токен от BotFather
-   - `BOT_USERNAME` — username бота
+   - `BOT_USERNAME` — username бота (необязательно, бот узнает его сам)
    - `BOT_TIMEZONE` — например `Europe/Prague`
    - `DB_URL` — `jdbc:sqlite:/data/bot.db`
 4. **ВАЖНО:** добавь **Volume** и примонтируй его к пути `/data`.
