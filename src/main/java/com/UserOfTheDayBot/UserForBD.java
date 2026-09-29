@@ -15,14 +15,23 @@ public class UserForBD {
         this.firstName = firstName;
     }
 
-    /** Имя для записи в БД / сравнений. */
-    public String getName() {
+    /**
+     * Имя для списков (статистика, история): username без «@», либо имя.
+     * Без «@», чтобы вывод статистики не пинговал всех игроков.
+     */
+    public String getDisplayName() {
         return isNullName(username) ? safe(firstName) : username;
     }
 
-    /** Имя для упоминания в чате: @username, либо имя, если username нет. */
-    public String getNotificationName() {
-        return isNullName(username) ? safe(firstName) : "@" + username;
+    /**
+     * HTML-упоминание для объявления победителя: @username, а если username нет —
+     * ссылка tg://user, чтобы человек без ника тоже получил уведомление.
+     */
+    public String getMentionHtml() {
+        if (!isNullName(username)) {
+            return "@" + Html.escape(username);
+        }
+        return "<a href=\"tg://user?id=" + id + "\">" + Html.escape(safe(firstName)) + "</a>";
     }
 
     public long getId() {

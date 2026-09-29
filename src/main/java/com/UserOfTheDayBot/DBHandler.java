@@ -1,6 +1,5 @@
 package com.UserOfTheDayBot;
 
-import com.UserOfTheDayBot.enums.DBColumns;
 import com.UserOfTheDayBot.enums.Games;
 import com.UserOfTheDayBot.exceptions.ExistedUserException;
 import com.UserOfTheDayBot.model.HistoryEntry;
@@ -16,32 +15,45 @@ import java.util.List;
  *
  * Вся база — один файл (см. db.url, по умолчанию bot.db рядом с программой).
  * Отдельный сервер БД не нужен. Таблицы создаются автоматически при старте,
- * поэтому никаких ручных шагов с базой нет.
+ * а старые базы обновляются миграциями (PRAGMA user_version).
  *
  * Соединение одно на всё приложение, доступ к методам синхронизирован —
  * для бота в одном экземпляре этого достаточно и исключает ошибки блокировок.
+ *
+ * Источник правды о розыгрышах — таблица history: «сегодня уже играли»
+ * означает, что в history есть запись этой игры с сегодняшней датой.
  */
 public class DBHandler {
+
+    /** Текущая версия схемы. Увеличивать при добавлении миграции в {@link #migrate()}. */
+    static final int SCHEMA_VERSION = 1;
 
     private final Connection connection;
 
     public DBHandler(Config config) {
+        this(config.dbUrl);
+    }
+
+    public DBHandler(String dbUrl) {
         try {
-            connection = DriverManager.getConnection(config.dbUrl);
+            connection = DriverManager.getConnection(dbUrl);
             try (Statement st = connection.createStatement()) {
                 st.execute("PRAGMA journal_mode=WAL");   // нормальная конкурентность чтения/записи
                 st.execute("PRAGMA busy_timeout=5000");  // ждать вместо мгновенной ошибки "locked"
                 st.execute("PRAGMA foreign_keys=ON");
             }
             initSchema();
+            migrate();
         } catch (SQLException e) {
-            throw new RuntimeException("Не удалось открыть базу: " + config.dbUrl, e);
+            throw new RuntimeException("Не удалось открыть базу: " + dbUrl, e);
         }
     }
 
-    /** Создаёт таблицы, если их ещё нет. */
+    /** Создаёт таблицы в исходном (версии 0) виде, если их ещё нет. */
     private void initSchema() throws SQLException {
         try (Statement st = connection.createStatement()) {
+            // Колонки user_of_the_day* / loser_of_the_day* в chats больше не используются
+            // (всё берётся из history), но оставлены для совместимости со старыми базами.
             st.execute("CREATE TABLE IF NOT EXISTS chats (" +
                     "chat_id INTEGER PRIMARY KEY," +
                     "user_of_the_day TEXT," +
@@ -74,6 +86,24 @@ public class DBHandler {
         }
     }
 
+    /** Пошаговые миграции схемы. Каждый шаг выполняется один раз. */
+    private void migrate() throws SQLException {
+        int version;
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA user_version")) {
+            version = rs.next() ? rs.getInt(1) : 0;
+        }
+        if (version < 1) {
+            inTransaction(() -> {
+                try (Statement st = connection.createStatement()) {
+                    // Выход из игры больше не удаляет строку со счётчиками — только снимает флаг.
+                    st.execute("ALTER TABLE chat_user ADD COLUMN active INTEGER NOT NULL DEFAULT 1");
+                    st.execute("PRAGMA user_version = 1");
+                }
+            });
+        }
+    }
+
     public void close() {
         try {
             if (connection != null && !connection.isClosed()) {
@@ -88,8 +118,9 @@ public class DBHandler {
     // Регистрация / выход
     // ---------------------------------------------------------------------
 
+    /** Зарегистрирован ли и активен ли игрок в чате. */
     public synchronized boolean isRegistered(long chatId, long userId) {
-        String sql = "SELECT 1 FROM chat_user WHERE chat_id = ? AND user_id = ?";
+        String sql = "SELECT 1 FROM chat_user WHERE chat_id = ? AND user_id = ? AND active = 1";
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             ps.setLong(1, chatId);
             ps.setLong(2, userId);
@@ -102,43 +133,37 @@ public class DBHandler {
         return false;
     }
 
+    /**
+     * Добавляет игрока в чат. Если он раньше выходил из игры — возвращает его
+     * с сохранёнными счётчиками.
+     */
     public synchronized void registration(long chatId, User user) throws ExistedUserException {
-        long userId = user.getId();
-        if (isRegistered(chatId, userId)) {
+        if (isRegistered(chatId, user.getId())) {
             throw new ExistedUserException();
         }
         try {
-            // 1) родитель: чат
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "INSERT OR IGNORE INTO chats (chat_id) VALUES (?)")) {
-                ps.setLong(1, chatId);
-                ps.executeUpdate();
-            }
-            // 2) родитель: пользователь (обновляем имя, если уже был)
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "INSERT INTO users (user_id, username, firstname) VALUES (?, ?, ?) " +
-                    "ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, " +
-                    "firstname = excluded.firstname")) {
-                ps.setLong(1, userId);
-                ps.setString(2, user.getUserName());
-                ps.setString(3, user.getFirstName());
-                ps.executeUpdate();
-            }
-            // 3) дочерняя: связь чат-пользователь
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "INSERT OR IGNORE INTO chat_user (chat_id, user_id) VALUES (?, ?)")) {
-                ps.setLong(1, chatId);
-                ps.setLong(2, userId);
-                ps.executeUpdate();
-            }
+            inTransaction(() -> {
+                ensureChat(chatId);
+                upsertUser(user);
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "INSERT INTO chat_user (chat_id, user_id) VALUES (?, ?) " +
+                        "ON CONFLICT(chat_id, user_id) DO UPDATE SET active = 1")) {
+                    ps.setLong(1, chatId);
+                    ps.setLong(2, user.getId());
+                    ps.executeUpdate();
+                }
+            });
         } catch (SQLException e) {
             e.printStackTrace();
         }
     }
 
-    /** issue #2: убрать игрока из игры в конкретном чате. */
+    /**
+     * issue #2: убрать игрока из игры в конкретном чате.
+     * Счётчики сохраняются — при повторном /reg игрок продолжит с ними.
+     */
     public synchronized boolean unregister(long chatId, long userId) {
-        String sql = "DELETE FROM chat_user WHERE chat_id = ? AND user_id = ?";
+        String sql = "UPDATE chat_user SET active = 0 WHERE chat_id = ? AND user_id = ? AND active = 1";
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             ps.setLong(1, chatId);
             ps.setLong(2, userId);
@@ -149,15 +174,74 @@ public class DBHandler {
         return false;
     }
 
+    /**
+     * Обновляет username / имя уже известного боту пользователя, чтобы
+     * в статистике не висели старые ники. Неизвестных пользователей не трогает.
+     */
+    public synchronized void refreshUser(User user) {
+        String sql = "UPDATE users SET username = ?, firstname = ? " +
+                     "WHERE user_id = ? AND (username IS NOT ? OR firstname IS NOT ?)";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, user.getUserName());
+            ps.setString(2, user.getFirstName());
+            ps.setLong(3, user.getId());
+            ps.setString(4, user.getUserName());
+            ps.setString(5, user.getFirstName());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Группа превратилась в супергруппу — у неё сменился chat_id.
+     * Переносим игроков, счётчики и историю на новый id. Повторный вызов безопасен.
+     */
+    public synchronized void migrateChat(long oldChatId, long newChatId) {
+        if (oldChatId == newChatId) {
+            return;
+        }
+        try {
+            inTransaction(() -> {
+                if (!chatExists(oldChatId)) {
+                    return;
+                }
+                ensureChat(newChatId);
+                // Если в новом чате уже кто-то зарегистрировался — эти строки не трогаем,
+                // а оставшиеся дубликаты удалятся каскадом вместе со старым чатом.
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "UPDATE OR IGNORE chat_user SET chat_id = ? WHERE chat_id = ?")) {
+                    ps.setLong(1, newChatId);
+                    ps.setLong(2, oldChatId);
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "UPDATE history SET chat_id = ? WHERE chat_id = ?")) {
+                    ps.setLong(1, newChatId);
+                    ps.setLong(2, oldChatId);
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "DELETE FROM chats WHERE chat_id = ?")) {
+                    ps.setLong(1, oldChatId);
+                    ps.executeUpdate();
+                }
+            });
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Игроки и розыгрыш
     // ---------------------------------------------------------------------
 
+    /** Активные игроки чата. */
     public synchronized List<UserForBD> getListOfPlayers(long chatId) {
         List<UserForBD> players = new ArrayList<>();
         String sql = "SELECT u.user_id, u.username, u.firstname, cu.user_day_counter, cu.loser_counter " +
                      "FROM users u JOIN chat_user cu ON cu.user_id = u.user_id " +
-                     "WHERE cu.chat_id = ?";
+                     "WHERE cu.chat_id = ? AND cu.active = 1";
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             ps.setLong(1, chatId);
             try (ResultSet rs = ps.executeQuery()) {
@@ -174,68 +258,25 @@ public class DBHandler {
         return players;
     }
 
-    public synchronized boolean isTheSameDayRunning(long chatId, int dayOfYear, DBColumns column) {
-        String sql = "SELECT " + column + " FROM chats WHERE chat_id = ?";
+    /** Победитель игры за указанную дату или null, если в этот день не играли. */
+    public synchronized UserForBD getWinnerOn(long chatId, Games game, LocalDate date) {
+        String sql = "SELECT h.winner_user_id, u.username, u.firstname, h.winner_name " +
+                     "FROM history h LEFT JOIN users u ON u.user_id = h.winner_user_id " +
+                     "WHERE h.chat_id = ? AND h.game = ? AND h.run_date = ? " +
+                     "ORDER BY h.id DESC LIMIT 1";
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
             ps.setLong(1, chatId);
+            ps.setString(2, game.name());
+            ps.setString(3, date.toString());
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
-                    int stored = rs.getInt(1);
-                    return !rs.wasNull() && stored == dayOfYear;
-                }
-            }
-        } catch (SQLException e) {
-            e.printStackTrace();
-        }
-        return false;
-    }
-
-    public synchronized void setWinnerAndDayRunning(long chatId, UserForBD user, int dayOfYear, Games game) {
-        String winnerColumn;
-        String dayColumn;
-        String counterColumn;
-        switch (game) {
-            case user_of_the_day:
-                winnerColumn = "user_of_the_day";
-                dayColumn = "user_of_the_day_run_day";
-                counterColumn = "user_day_counter";
-                break;
-            case loser_of_the_day:
-                winnerColumn = "loser_of_the_day";
-                dayColumn = "loser_of_the_day_run_day";
-                counterColumn = "loser_counter";
-                break;
-            default:
-                return;
-        }
-        try {
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "UPDATE chats SET " + winnerColumn + " = ?, " + dayColumn + " = ? WHERE chat_id = ?")) {
-                ps.setString(1, user.getName());
-                ps.setInt(2, dayOfYear);
-                ps.setLong(3, chatId);
-                ps.executeUpdate();
-            }
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "UPDATE chat_user SET " + counterColumn + " = " + counterColumn + " + 1 " +
-                    "WHERE chat_id = ? AND user_id = ?")) {
-                ps.setLong(1, chatId);
-                ps.setLong(2, user.getId());
-                ps.executeUpdate();
-            }
-            addHistory(chatId, game, user, LocalDate.now());
-        } catch (SQLException e) {
-            e.printStackTrace();
-        }
-    }
-
-    public synchronized String getWinnerOfTheGame(long chatId, Games game) {
-        String sql = "SELECT " + game + " FROM chats WHERE chat_id = ?";
-        try (PreparedStatement ps = connection.prepareStatement(sql)) {
-            ps.setLong(1, chatId);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    return rs.getString(1);
+                    String username = rs.getString(2);
+                    String firstname = rs.getString(3);
+                    if (username == null && firstname == null) {
+                        // пользователя нет в users — берём имя, сохранённое в истории
+                        firstname = rs.getString(4);
+                    }
+                    return new UserForBD(rs.getLong(1), username, firstname);
                 }
             }
         } catch (SQLException e) {
@@ -244,32 +285,52 @@ public class DBHandler {
         return null;
     }
 
+    /**
+     * Записывает победителя: +1 к счётчику и запись в history с датой {@code date}
+     * (дата должна быть в часовом поясе бота). Всё в одной транзакции.
+     */
+    public synchronized void saveWinner(long chatId, UserForBD user, LocalDate date, Games game) {
+        String counterColumn = game == Games.user_of_the_day ? "user_day_counter" : "loser_counter";
+        try {
+            inTransaction(() -> {
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "UPDATE chat_user SET " + counterColumn + " = " + counterColumn + " + 1 " +
+                        "WHERE chat_id = ? AND user_id = ?")) {
+                    ps.setLong(1, chatId);
+                    ps.setLong(2, user.getId());
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "INSERT INTO history (chat_id, game, winner_user_id, winner_name, run_date) " +
+                        "VALUES (?, ?, ?, ?, ?)")) {
+                    ps.setLong(1, chatId);
+                    ps.setString(2, game.name());
+                    ps.setLong(3, user.getId());
+                    ps.setString(4, user.getDisplayName());
+                    ps.setString(5, date.toString());   // ISO yyyy-MM-dd
+                    ps.executeUpdate();
+                }
+            });
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
     // ---------------------------------------------------------------------
     // История победителей
     // ---------------------------------------------------------------------
-
-    private void addHistory(long chatId, Games game, UserForBD user, LocalDate date) throws SQLException {
-        try (PreparedStatement ps = connection.prepareStatement(
-                "INSERT INTO history (chat_id, game, winner_user_id, winner_name, run_date) " +
-                "VALUES (?, ?, ?, ?, ?)")) {
-            ps.setLong(1, chatId);
-            ps.setString(2, game.name());
-            ps.setLong(3, user.getId());
-            ps.setString(4, user.getNotificationName());
-            ps.setString(5, date.toString());   // ISO yyyy-MM-dd
-            ps.executeUpdate();
-        }
-    }
 
     /** Последние N записей истории. game == null -> обе игры. */
     public synchronized List<HistoryEntry> getHistory(long chatId, Games game, int limit) {
         List<HistoryEntry> result = new ArrayList<>();
         StringBuilder sql = new StringBuilder(
-                "SELECT run_date, game, winner_name FROM history WHERE chat_id = ?");
+                "SELECT h.run_date, h.game, h.winner_name, u.username, u.firstname " +
+                "FROM history h LEFT JOIN users u ON u.user_id = h.winner_user_id " +
+                "WHERE h.chat_id = ?");
         if (game != null) {
-            sql.append(" AND game = ?");
+            sql.append(" AND h.game = ?");
         }
-        sql.append(" ORDER BY run_date DESC, id DESC LIMIT ?");
+        sql.append(" ORDER BY h.run_date DESC, h.id DESC LIMIT ?");
 
         try (PreparedStatement ps = connection.prepareStatement(sql.toString())) {
             int i = 1;
@@ -280,10 +341,12 @@ public class DBHandler {
             ps.setInt(i, limit);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    result.add(new HistoryEntry(
-                            LocalDate.parse(rs.getString(1)),
-                            rs.getString(2),
-                            rs.getString(3)));
+                    String username = rs.getString(4);
+                    String firstname = rs.getString(5);
+                    String name = (username == null && firstname == null)
+                            ? rs.getString(3)
+                            : new UserForBD(0, username, firstname).getDisplayName();
+                    result.add(new HistoryEntry(LocalDate.parse(rs.getString(1)), rs.getString(2), name));
                 }
             }
         } catch (SQLException e) {
@@ -298,24 +361,71 @@ public class DBHandler {
 
     public synchronized void resetChatStatistics(long chatId) {
         try {
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "UPDATE chat_user SET user_day_counter = 0, loser_counter = 0 WHERE chat_id = ?")) {
-                ps.setLong(1, chatId);
-                ps.executeUpdate();
-            }
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "UPDATE chats SET user_of_the_day = NULL, loser_of_the_day = NULL, " +
-                    "user_of_the_day_run_day = NULL, loser_of_the_day_run_day = NULL WHERE chat_id = ?")) {
-                ps.setLong(1, chatId);
-                ps.executeUpdate();
-            }
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "DELETE FROM history WHERE chat_id = ?")) {
-                ps.setLong(1, chatId);
-                ps.executeUpdate();
-            }
+            inTransaction(() -> {
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "UPDATE chat_user SET user_day_counter = 0, loser_counter = 0 WHERE chat_id = ?")) {
+                    ps.setLong(1, chatId);
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "DELETE FROM history WHERE chat_id = ?")) {
+                    ps.setLong(1, chatId);
+                    ps.executeUpdate();
+                }
+            });
         } catch (SQLException e) {
             e.printStackTrace();
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Вспомогательное
+    // ---------------------------------------------------------------------
+
+    @FunctionalInterface
+    private interface SqlWork {
+        void run() throws SQLException;
+    }
+
+    private void inTransaction(SqlWork work) throws SQLException {
+        connection.setAutoCommit(false);
+        try {
+            work.run();
+            connection.commit();
+        } catch (SQLException | RuntimeException e) {
+            connection.rollback();
+            throw e;
+        } finally {
+            connection.setAutoCommit(true);
+        }
+    }
+
+    private boolean chatExists(long chatId) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement("SELECT 1 FROM chats WHERE chat_id = ?")) {
+            ps.setLong(1, chatId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    private void ensureChat(long chatId) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT OR IGNORE INTO chats (chat_id) VALUES (?)")) {
+            ps.setLong(1, chatId);
+            ps.executeUpdate();
+        }
+    }
+
+    private void upsertUser(User user) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT INTO users (user_id, username, firstname) VALUES (?, ?, ?) " +
+                "ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, " +
+                "firstname = excluded.firstname")) {
+            ps.setLong(1, user.getId());
+            ps.setString(2, user.getUserName());
+            ps.setString(3, user.getFirstName());
+            ps.executeUpdate();
         }
     }
 }

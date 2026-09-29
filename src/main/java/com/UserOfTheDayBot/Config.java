@@ -31,7 +31,7 @@ public class Config {
         this.botUsername = pick(props, "bot.username", "BOT_USERNAME", "");
         this.botToken    = pick(props, "bot.token",    "BOT_TOKEN",    "");
         this.dbUrl       = pick(props, "db.url",       "DB_URL",       "jdbc:sqlite:bot.db");
-        this.zoneId      = ZoneId.of(pick(props, "bot.timezone", "BOT_TIMEZONE", "Europe/Moscow"));
+        this.zoneId      = ZoneId.of(pick(props, "bot.timezone", "BOT_TIMEZONE", "Europe/Prague"));
 
         if (botToken.isBlank() || botUsername.isBlank()) {
             throw new IllegalStateException(

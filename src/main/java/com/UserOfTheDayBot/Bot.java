@@ -1,7 +1,6 @@
 package com.UserOfTheDayBot;
 
 import com.UserOfTheDayBot.enums.Commands;
-import com.UserOfTheDayBot.enums.DBColumns;
 import com.UserOfTheDayBot.enums.Games;
 import com.UserOfTheDayBot.exceptions.ExistedUserException;
 import com.UserOfTheDayBot.model.HistoryEntry;
@@ -18,8 +17,11 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Random;
-import java.util.Timer;
-import java.util.TimerTask;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class Bot extends TelegramLongPollingBot {
 
@@ -27,27 +29,24 @@ public class Bot extends TelegramLongPollingBot {
     private final DBHandler dbHandler;
     private final Random random = new Random();
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
+    private static final long MESSAGE_DELAY_MS = 1500;
+
+    // Один поток на все отложенные сообщения розыгрышей (раньше на каждый розыгрыш
+    // создавался новый Timer со своим потоком, который никто не останавливал).
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "draw-announcer");
+        t.setDaemon(true);
+        return t;
+    });
+
+    // Розыгрыши, которые сейчас «крутятся» (ключ chatId:game). Пока розыгрыш идёт,
+    // повторный /run не выдаёт победителя раньше объявления.
+    private final Set<String> drawsInProgress = ConcurrentHashMap.newKeySet();
 
     public Bot(Config config, DBHandler dbHandler) {
         super(config.botToken);
         this.config = config;
         this.dbHandler = dbHandler;
-    }
-
-    // Отложенная отправка сообщений (для эффекта "розыгрыша")
-    private class TimerSendingTask extends TimerTask {
-        private final long chatId;
-        private final String message;
-
-        TimerSendingTask(long chatId, String message) {
-            this.chatId = chatId;
-            this.message = message;
-        }
-
-        @Override
-        public void run() {
-            sendMsg(chatId, message);
-        }
     }
 
     private final String[] messagesForUserOfTheDay = {
@@ -77,6 +76,18 @@ public class Bot extends TelegramLongPollingBot {
         Message message = update.getMessage();
         long chatId = message.getChatId();
 
+        // Группа стала супергруппой -> у чата новый id, переносим туда статистику.
+        // Telegram присылает два сервисных сообщения (в старый и в новый чат) — обрабатываем оба,
+        // перенос идемпотентный.
+        if (message.getMigrateToChatId() != null) {
+            dbHandler.migrateChat(chatId, message.getMigrateToChatId());
+            return;
+        }
+        if (message.getMigrateFromChatId() != null) {
+            dbHandler.migrateChat(message.getMigrateFromChatId(), chatId);
+            return;
+        }
+
         // issue #2: кто-то вышел/был удалён из чата -> убираем из игры автоматически
         if (message.getLeftChatMember() != null) {
             User left = message.getLeftChatMember();
@@ -84,6 +95,11 @@ public class Bot extends TelegramLongPollingBot {
                 System.out.println("Авто-удалён вышедший участник: " + left.getId());
             }
             return;
+        }
+
+        // держим username / имя в актуальном состоянии
+        if (message.getFrom() != null) {
+            dbHandler.refreshUser(message.getFrom());
         }
 
         // обрабатываем только текстовые команды; стикеры/фото/сервисные сообщения игнорим
@@ -101,6 +117,10 @@ public class Bot extends TelegramLongPollingBot {
         String commandPart = spaceIdx == -1 ? body : body.substring(0, spaceIdx);
         int atIdx = commandPart.indexOf('@');
         if (atIdx != -1) {
+            // команда адресована другому боту в этом чате — не наша
+            if (!commandPart.substring(atIdx + 1).equalsIgnoreCase(getBotUsername())) {
+                return;
+            }
             commandPart = commandPart.substring(0, atIdx);
         }
 
@@ -144,10 +164,10 @@ public class Bot extends TelegramLongPollingBot {
                 sendHistory(chatId);
                 break;
             case remove:
-                removePlayer(chatId, from, message);
+                removePlayer(chatId, message);
                 break;
             case reset:
-                resetStatistics(chatId, from);
+                resetStatistics(chatId, message);
                 break;
             default:
                 break;
@@ -159,44 +179,43 @@ public class Bot extends TelegramLongPollingBot {
     // ---------------------------------------------------------------------
 
     private void runGame(long chatId, Games game) {
+        String drawKey = chatId + ":" + game;
+        if (drawsInProgress.contains(drawKey)) {
+            sendMsg(chatId, "⏳ Розыгрыш уже идёт, дождитесь результата!");
+            return;
+        }
+
+        String[] messages = game == Games.user_of_the_day ? messagesForUserOfTheDay : messagesForLoserOfTheDay;
+        LocalDate today = today();
+        UserForBD todaysWinner = dbHandler.getWinnerOn(chatId, game, today);
+        if (todaysWinner != null) {
+            sendHtml(chatId, Html.escape(messages[0]) + todaysWinner.getMentionHtml());
+            return;
+        }
+
         List<UserForBD> usersInGame = dbHandler.getListOfPlayers(chatId);
         if (usersInGame.isEmpty()) {
             sendMsg(chatId, "Нет игроков. Сначала зарегистрируйтесь командой /reg");
             return;
         }
 
-        String[] messages;
-        switch (game) {
-            case user_of_the_day:
-                if (dbHandler.isTheSameDayRunning(chatId, getDayOfYear(), DBColumns.user_of_the_day_run_day)) {
-                    sendMsg(chatId, messagesForUserOfTheDay[0]
-                            + dbHandler.getWinnerOfTheGame(chatId, Games.user_of_the_day));
-                    return;
-                }
-                messages = messagesForUserOfTheDay;
-                break;
-            case loser_of_the_day:
-                if (dbHandler.isTheSameDayRunning(chatId, getDayOfYear(), DBColumns.loser_of_the_day_run_day)) {
-                    sendMsg(chatId, messagesForLoserOfTheDay[0]
-                            + dbHandler.getWinnerOfTheGame(chatId, Games.loser_of_the_day));
-                    return;
-                }
-                messages = messagesForLoserOfTheDay;
-                break;
-            default:
-                return;
-        }
-
-        Timer timer = new Timer();
-        final int MESSAGE_DELAY = 1500;
-        for (int i = 1; i < messages.length; i++) {
-            timer.schedule(new TimerSendingTask(chatId, messages[i]), (long) MESSAGE_DELAY * i);
-        }
         UserForBD winner = usersInGame.get(random.nextInt(usersInGame.size()));
-        timer.schedule(new TimerSendingTask(chatId, messages[0] + winner.getNotificationName()),
-                (long) MESSAGE_DELAY * messages.length);
+        // Победителя записываем сразу (чтобы рестарт посреди анимации не дал разыграть день дважды),
+        // а объявляем в конце анимации.
+        dbHandler.saveWinner(chatId, winner, today, game);
+        drawsInProgress.add(drawKey);
 
-        dbHandler.setWinnerAndDayRunning(chatId, winner, getDayOfYear(), game);
+        for (int i = 1; i < messages.length; i++) {
+            String line = messages[i];
+            scheduler.schedule(() -> sendMsg(chatId, line), MESSAGE_DELAY_MS * i, TimeUnit.MILLISECONDS);
+        }
+        scheduler.schedule(() -> {
+            try {
+                sendHtml(chatId, Html.escape(messages[0]) + winner.getMentionHtml());
+            } finally {
+                drawsInProgress.remove(drawKey);
+            }
+        }, MESSAGE_DELAY_MS * messages.length, TimeUnit.MILLISECONDS);
     }
 
     private void addUserInGame(long chatId, User user) {
@@ -221,14 +240,14 @@ public class Bot extends TelegramLongPollingBot {
             sb = new StringBuilder("\uD83C\uDF89 Результаты Красавчик Дня\n");
             players.sort((a, b) -> b.getUserDayCounter() - a.getUserDayCounter());
             for (UserForBD u : players) {
-                sb.append(i++).append(") ").append(u.getNotificationName())
+                sb.append(i++).append(") ").append(u.getDisplayName())
                   .append(" - ").append(u.getUserDayCounter()).append(" раз(а)\n");
             }
         } else {
             sb = new StringBuilder("Результаты \uD83C\uDF08 Неудачника Дня\n");
             players.sort((a, b) -> b.getLoserDayCounter() - a.getLoserDayCounter());
             for (UserForBD u : players) {
-                sb.append(i++).append(") ").append(u.getNotificationName())
+                sb.append(i++).append(") ").append(u.getDisplayName())
                   .append(" - ").append(u.getLoserDayCounter()).append(" раз(а)\n");
             }
         }
@@ -256,8 +275,8 @@ public class Bot extends TelegramLongPollingBot {
     // ---------------------------------------------------------------------
 
     /** issue #2: админ отвечает (reply) на сообщение игрока и пишет /remove. */
-    private void removePlayer(long chatId, User requester, Message message) {
-        if (!isAdmin(chatId, requester.getId())) {
+    private void removePlayer(long chatId, Message message) {
+        if (!isAdmin(chatId, message)) {
             sendMsg(chatId, "Эта команда только для администраторов чата.");
             return;
         }
@@ -275,8 +294,8 @@ public class Bot extends TelegramLongPollingBot {
     }
 
     /** issue #5: сброс статистики чата (только админ). */
-    private void resetStatistics(long chatId, User requester) {
-        if (!isAdmin(chatId, requester.getId())) {
+    private void resetStatistics(long chatId, Message message) {
+        if (!isAdmin(chatId, message)) {
             sendMsg(chatId, "Эта команда только для администраторов чата.");
             return;
         }
@@ -284,11 +303,19 @@ public class Bot extends TelegramLongPollingBot {
         sendMsg(chatId, "Статистика чата сброшена. История очищена.");
     }
 
-    private boolean isAdmin(long chatId, long userId) {
+    private boolean isAdmin(long chatId, Message message) {
         // в личке считаем пользователя "админом" самого себя
         if (chatId > 0) {
             return true;
         }
+        // анонимный админ пишет от имени самой группы
+        if (message.getSenderChat() != null && message.getSenderChat().getId() == chatId) {
+            return true;
+        }
+        if (message.getFrom() == null) {
+            return false;
+        }
+        long userId = message.getFrom().getId();
         try {
             GetChatAdministrators g = new GetChatAdministrators();
             g.setChatId(String.valueOf(chatId));
@@ -308,11 +335,23 @@ public class Bot extends TelegramLongPollingBot {
     // Вспомогательное
     // ---------------------------------------------------------------------
 
-    private synchronized void sendMsg(long chatId, String text) {
-        SendMessage sendMessage = SendMessage.builder()
+    private void sendMsg(long chatId, String text) {
+        send(SendMessage.builder()
                 .chatId(String.valueOf(chatId))
                 .text(text)
-                .build();
+                .build());
+    }
+
+    /** Сообщение с HTML-разметкой: всё динамическое должно быть экранировано через {@link Html}. */
+    private void sendHtml(long chatId, String html) {
+        send(SendMessage.builder()
+                .chatId(String.valueOf(chatId))
+                .text(html)
+                .parseMode("HTML")
+                .build());
+    }
+
+    private synchronized void send(SendMessage sendMessage) {
         try {
             execute(sendMessage);
         } catch (TelegramApiException e) {
@@ -333,10 +372,9 @@ public class Bot extends TelegramLongPollingBot {
                "/reset — (админ) сбросить статистику чата";
     }
 
-    // Используем день года (1..366): уникален в пределах года и не путается,
-    // в отличие от оригинального формата "DD" (там был баг: день года вместо дня месяца).
-    private int getDayOfYear() {
-        return LocalDate.now(config.zoneId).getDayOfYear();
+    /** «Сегодня» в часовом поясе бота (BOT_TIMEZONE), а не сервера. */
+    private LocalDate today() {
+        return LocalDate.now(config.zoneId);
     }
 
     @Override

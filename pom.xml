@@ -20,21 +20,21 @@
         <dependency>
             <groupId>org.telegram</groupId>
             <artifactId>telegrambots</artifactId>
-            <version>6.8.0</version>
+            <version>6.9.7.1</version>
         </dependency>
 
         <!-- SQLite: вся база в одном файле, отдельный сервер не нужен -->
         <dependency>
             <groupId>org.xerial</groupId>
             <artifactId>sqlite-jdbc</artifactId>
-            <version>3.53.2.0</version>
+            <version>3.53.4.0</version>
         </dependency>
 
         <!-- Логирование (telegrambots требует slf4j) -->
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-simple</artifactId>
-            <version>2.0.7</version>
+            <version>2.0.20</version>
         </dependency>
     </dependencies>
 
@@ -44,7 +44,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
-                <version>3.5.1</version>
+                <version>3.6.2</version>
                 <executions>
                     <execution>
                         <phase>package</phase>

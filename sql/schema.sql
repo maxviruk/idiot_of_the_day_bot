@@ -12,12 +12,17 @@
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
--- Чаты, где работает бот
+-- Версия схемы. Бот сам применяет миграции к старым базам (DBHandler.migrate()).
+PRAGMA user_version = 1;
+
+-- Чаты, где работает бот.
+-- Колонки user_of_the_day* / loser_of_the_day* устарели: победитель дня и факт
+-- «сегодня уже играли» теперь берутся из history. Оставлены для совместимости.
 CREATE TABLE IF NOT EXISTS chats (
     chat_id                  INTEGER PRIMARY KEY,
-    user_of_the_day          TEXT,      -- имя последнего "красавчика"
-    loser_of_the_day         TEXT,      -- имя последнего "неудачника"
-    user_of_the_day_run_day  INTEGER,   -- день года последнего розыгрыша
+    user_of_the_day          TEXT,
+    loser_of_the_day         TEXT,
+    user_of_the_day_run_day  INTEGER,
     loser_of_the_day_run_day INTEGER
 );
 
@@ -34,12 +39,13 @@ CREATE TABLE IF NOT EXISTS chat_user (
     user_id          INTEGER NOT NULL,
     user_day_counter INTEGER NOT NULL DEFAULT 0,
     loser_counter    INTEGER NOT NULL DEFAULT 0,
+    active           INTEGER NOT NULL DEFAULT 1,  -- 0 = вышел из игры (счётчики сохраняются)
     PRIMARY KEY (chat_id, user_id),
     FOREIGN KEY (chat_id) REFERENCES chats(chat_id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
 );
 
--- История победителей (для команды /history). Дата хранится как текст yyyy-MM-dd.
+-- История победителей. Дата — текст yyyy-MM-dd в часовом поясе бота (BOT_TIMEZONE).
 CREATE TABLE IF NOT EXISTS history (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id        INTEGER NOT NULL,
