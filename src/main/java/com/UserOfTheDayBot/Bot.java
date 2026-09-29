@@ -4,15 +4,21 @@ import com.UserOfTheDayBot.enums.Commands;
 import com.UserOfTheDayBot.enums.Games;
 import com.UserOfTheDayBot.exceptions.ExistedUserException;
 import com.UserOfTheDayBot.model.HistoryEntry;
-import org.telegram.telegrambots.bots.TelegramLongPollingBot;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.telegram.telegrambots.longpolling.util.LongPollingSingleThreadUpdateConsumer;
+import org.telegram.telegrambots.meta.api.methods.commands.SetMyCommands;
 import org.telegram.telegrambots.meta.api.methods.groupadministration.GetChatAdministrators;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
-import org.telegram.telegrambots.meta.api.objects.Message;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.User;
 import org.telegram.telegrambots.meta.api.objects.chatmember.ChatMember;
+import org.telegram.telegrambots.meta.api.objects.commands.BotCommand;
+import org.telegram.telegrambots.meta.api.objects.message.Message;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+import org.telegram.telegrambots.meta.generics.TelegramClient;
 
+import java.time.Clock;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
@@ -23,16 +29,19 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
-public class Bot extends TelegramLongPollingBot {
+public class Bot implements LongPollingSingleThreadUpdateConsumer {
 
-    private final Config config;
-    private final DBHandler dbHandler;
-    private final Random random = new Random();
+    private static final Logger log = LoggerFactory.getLogger(Bot.class);
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
-    private static final long MESSAGE_DELAY_MS = 1500;
 
-    // Один поток на все отложенные сообщения розыгрышей (раньше на каждый розыгрыш
-    // создавался новый Timer со своим потоком, который никто не останавливал).
+    private final TelegramClient telegramClient;
+    private final DBHandler dbHandler;
+    private final String botUsername;
+    private final Clock clock;
+    private final long messageDelayMs;
+    private final Random random = new Random();
+
+    // Один поток на все отложенные сообщения розыгрышей.
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "draw-announcer");
         t.setDaemon(true);
@@ -43,33 +52,79 @@ public class Bot extends TelegramLongPollingBot {
     // повторный /run не выдаёт победителя раньше объявления.
     private final Set<String> drawsInProgress = ConcurrentHashMap.newKeySet();
 
-    public Bot(Config config, DBHandler dbHandler) {
-        super(config.botToken);
-        this.config = config;
+    /**
+     * @param clock          часы в часовом поясе бота — по ним определяется «сегодня»
+     * @param messageDelayMs пауза между сообщениями анимации розыгрыша
+     */
+    public Bot(TelegramClient telegramClient, DBHandler dbHandler, String botUsername,
+               Clock clock, long messageDelayMs) {
+        this.telegramClient = telegramClient;
         this.dbHandler = dbHandler;
+        this.botUsername = botUsername;
+        this.clock = clock;
+        this.messageDelayMs = messageDelayMs;
     }
 
     private final String[] messagesForUserOfTheDay = {
-            "\uD83C\uDF89 Сегодня красавчик дня - ",
-            "ВНИМАНИЕ \uD83D\uDD25",
+            "🎉 Сегодня красавчик дня - ",
+            "ВНИМАНИЕ 🔥",
             "Ищем красавчика в этом чате",
-            "Гадаем на бинарных опционах \uD83D\uDCCA",
-            "Анализируем лунный гороскоп \uD83C\uDF16",
-            "Лунная призма дай мне силу \uD83D\uDCAB",
-            "СЕКТОР ПРИЗ НА БАРАБАНЕ \uD83C\uDFAF"
+            "Гадаем на бинарных опционах 📊",
+            "Анализируем лунный гороскоп 🌖",
+            "Лунная призма дай мне силу 💫",
+            "СЕКТОР ПРИЗ НА БАРАБАНЕ 🎯"
     };
     private final String[] messagesForLoserOfTheDay = {
-            "\uD83C\uDF89 Сегодня неудачник \uD83C\uDF08 дня - ",
-            "ВНИМАНИЕ \uD83D\uDD25",
-            "ФЕДЕРАЛЬНЫЙ \uD83D\uDD0D РОЗЫСК НЕУДАЧНИКА \uD83D\uDEA8",
-            "4 - спутник запущен \uD83D\uDE80",
-            "3 - сводки Интерпола проверены \uD83D\uDE93",
-            "2 - твои друзья опрошены \uD83D\uDE45",
-            "1 - твой профиль в соцсетях проанализирован \uD83D\uDE40"
+            "🎉 Сегодня неудачник 🌈 дня - ",
+            "ВНИМАНИЕ 🔥",
+            "ФЕДЕРАЛЬНЫЙ 🔍 РОЗЫСК НЕУДАЧНИКА 🚨",
+            "4 - спутник запущен 🚀",
+            "3 - сводки Интерпола проверены 🚓",
+            "2 - твои друзья опрошены 🙅",
+            "1 - твой профиль в соцсетях проанализирован 🙀"
     };
 
+    /** Регистрирует список команд, чтобы Telegram подсказывал их при вводе «/». */
+    public void registerCommands() {
+        List<BotCommand> commands = List.of(
+                new BotCommand("reg", "вступить в игру"),
+                new BotCommand("unreg", "выйти из игры"),
+                new BotCommand("run", "разыграть красавчика дня"),
+                new BotCommand("loser", "разыграть неудачника дня"),
+                new BotCommand("stat_user", "статистика красавчиков"),
+                new BotCommand("stat_loser", "статистика неудачников"),
+                new BotCommand("history", "история победителей"),
+                new BotCommand("remove", "(админ) удалить игрока — ответом на сообщение"),
+                new BotCommand("reset", "(админ) сбросить статистику чата"),
+                new BotCommand("help", "справка"));
+        try {
+            telegramClient.execute(new SetMyCommands(commands));
+        } catch (TelegramApiException e) {
+            log.warn("Не удалось зарегистрировать список команд", e);
+        }
+    }
+
+    /** Останавливает поток анимаций (вызывается при завершении приложения). */
+    public void shutdown() {
+        scheduler.shutdown();
+        try {
+            scheduler.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     @Override
-    public void onUpdateReceived(Update update) {
+    public void consume(Update update) {
+        try {
+            handleUpdate(update);
+        } catch (RuntimeException e) {
+            // одно сломанное сообщение не должно останавливать обработку остальных
+            log.error("Ошибка при обработке update {}", update.getUpdateId(), e);
+        }
+    }
+
+    private void handleUpdate(Update update) {
         if (!update.hasMessage()) {
             return;
         }
@@ -92,7 +147,7 @@ public class Bot extends TelegramLongPollingBot {
         if (message.getLeftChatMember() != null) {
             User left = message.getLeftChatMember();
             if (dbHandler.unregister(chatId, left.getId())) {
-                System.out.println("Авто-удалён вышедший участник: " + left.getId());
+                log.info("Авто-удалён вышедший участник {} из чата {}", left.getId(), chatId);
             }
             return;
         }
@@ -106,71 +161,55 @@ public class Bot extends TelegramLongPollingBot {
         if (!message.hasText()) {
             return;
         }
-        String text = message.getText().trim();
-        if (!text.startsWith("/")) {
-            return;
-        }
-
-        // /command@BotName arg -> вытаскиваем имя команды
-        String body = text.substring(1);
-        int spaceIdx = body.indexOf(' ');
-        String commandPart = spaceIdx == -1 ? body : body.substring(0, spaceIdx);
-        int atIdx = commandPart.indexOf('@');
-        if (atIdx != -1) {
-            // команда адресована другому боту в этом чате — не наша
-            if (!commandPart.substring(atIdx + 1).equalsIgnoreCase(getBotUsername())) {
-                return;
-            }
-            commandPart = commandPart.substring(0, atIdx);
-        }
-
-        Commands command;
-        try {
-            command = Commands.valueOf(commandPart.toLowerCase());
-        } catch (IllegalArgumentException e) {
-            // неизвестная команда — просто молчим (в оригинале здесь падало)
+        Commands command = parseCommand(message.getText(), botUsername);
+        if (command == null) {
             return;
         }
 
         User from = message.getFrom();
         switch (command) {
-            case start:
-            case help:
-                sendMsg(chatId, helpText());
-                break;
-            case reg:
-                addUserInGame(chatId, from);
-                break;
-            case unreg:
+            case start, help -> sendMsg(chatId, helpText());
+            case reg -> addUserInGame(chatId, from);
+            case unreg -> {
                 if (dbHandler.unregister(chatId, from.getId())) {
                     sendMsg(chatId, "Ты вышел из игры.");
                 } else {
                     sendMsg(chatId, "Тебя и так нет в игре.");
                 }
-                break;
-            case run:
-                runGame(chatId, Games.user_of_the_day);
-                break;
-            case loser:
-                runGame(chatId, Games.loser_of_the_day);
-                break;
-            case stat_user:
-                sendStatisticOfTheGame(chatId, Games.user_of_the_day);
-                break;
-            case stat_loser:
-                sendStatisticOfTheGame(chatId, Games.loser_of_the_day);
-                break;
-            case history:
-                sendHistory(chatId);
-                break;
-            case remove:
-                removePlayer(chatId, message);
-                break;
-            case reset:
-                resetStatistics(chatId, message);
-                break;
-            default:
-                break;
+            }
+            case run -> runGame(chatId, Games.user_of_the_day);
+            case loser -> runGame(chatId, Games.loser_of_the_day);
+            case stat_user -> sendStatisticOfTheGame(chatId, Games.user_of_the_day);
+            case stat_loser -> sendStatisticOfTheGame(chatId, Games.loser_of_the_day);
+            case history -> sendHistory(chatId);
+            case remove -> removePlayer(chatId, message);
+            case reset -> resetStatistics(chatId, message);
+        }
+    }
+
+    /**
+     * Разбирает текст вида «/command@BotName аргументы».
+     * Возвращает null, если это не команда, команда неизвестна или адресована другому боту.
+     */
+    static Commands parseCommand(String text, String botUsername) {
+        text = text.trim();
+        if (!text.startsWith("/")) {
+            return null;
+        }
+        String body = text.substring(1);
+        int spaceIdx = body.indexOf(' ');
+        String commandPart = spaceIdx == -1 ? body : body.substring(0, spaceIdx);
+        int atIdx = commandPart.indexOf('@');
+        if (atIdx != -1) {
+            if (!commandPart.substring(atIdx + 1).equalsIgnoreCase(botUsername)) {
+                return null;
+            }
+            commandPart = commandPart.substring(0, atIdx);
+        }
+        try {
+            return Commands.valueOf(commandPart.toLowerCase());
+        } catch (IllegalArgumentException e) {
+            return null;
         }
     }
 
@@ -207,7 +246,7 @@ public class Bot extends TelegramLongPollingBot {
 
         for (int i = 1; i < messages.length; i++) {
             String line = messages[i];
-            scheduler.schedule(() -> sendMsg(chatId, line), MESSAGE_DELAY_MS * i, TimeUnit.MILLISECONDS);
+            scheduler.schedule(() -> sendMsg(chatId, line), messageDelayMs * i, TimeUnit.MILLISECONDS);
         }
         scheduler.schedule(() -> {
             try {
@@ -215,7 +254,7 @@ public class Bot extends TelegramLongPollingBot {
             } finally {
                 drawsInProgress.remove(drawKey);
             }
-        }, MESSAGE_DELAY_MS * messages.length, TimeUnit.MILLISECONDS);
+        }, messageDelayMs * messages.length, TimeUnit.MILLISECONDS);
     }
 
     private void addUserInGame(long chatId, User user) {
@@ -237,14 +276,14 @@ public class Bot extends TelegramLongPollingBot {
         StringBuilder sb;
         int i = 1;
         if (game == Games.user_of_the_day) {
-            sb = new StringBuilder("\uD83C\uDF89 Результаты Красавчик Дня\n");
+            sb = new StringBuilder("🎉 Результаты Красавчик Дня\n");
             players.sort((a, b) -> b.getUserDayCounter() - a.getUserDayCounter());
             for (UserForBD u : players) {
                 sb.append(i++).append(") ").append(u.getDisplayName())
                   .append(" - ").append(u.getUserDayCounter()).append(" раз(а)\n");
             }
         } else {
-            sb = new StringBuilder("Результаты \uD83C\uDF08 Неудачника Дня\n");
+            sb = new StringBuilder("Результаты 🌈 Неудачника Дня\n");
             players.sort((a, b) -> b.getLoserDayCounter() - a.getLoserDayCounter());
             for (UserForBD u : players) {
                 sb.append(i++).append(") ").append(u.getDisplayName())
@@ -261,7 +300,7 @@ public class Bot extends TelegramLongPollingBot {
             sendMsg(chatId, "История пуста. Сыграйте /run или /loser.");
             return;
         }
-        StringBuilder sb = new StringBuilder("\uD83D\uDCDC История (последние 20):\n");
+        StringBuilder sb = new StringBuilder("📜 История (последние 20):\n");
         for (HistoryEntry e : entries) {
             String label = e.game.equals(Games.user_of_the_day.name()) ? "красавчик" : "неудачник";
             sb.append(e.date.format(DATE_FMT)).append(" — ")
@@ -317,16 +356,14 @@ public class Bot extends TelegramLongPollingBot {
         }
         long userId = message.getFrom().getId();
         try {
-            GetChatAdministrators g = new GetChatAdministrators();
-            g.setChatId(String.valueOf(chatId));
-            List<ChatMember> admins = execute(g);
+            List<ChatMember> admins = telegramClient.execute(new GetChatAdministrators(String.valueOf(chatId)));
             for (ChatMember cm : admins) {
                 if (cm.getUser() != null && userId == cm.getUser().getId()) {
                     return true;
                 }
             }
         } catch (TelegramApiException e) {
-            e.printStackTrace();
+            log.warn("Не удалось получить список админов чата {}", chatId, e);
         }
         return false;
     }
@@ -337,7 +374,7 @@ public class Bot extends TelegramLongPollingBot {
 
     private void sendMsg(long chatId, String text) {
         send(SendMessage.builder()
-                .chatId(String.valueOf(chatId))
+                .chatId(chatId)
                 .text(text)
                 .build());
     }
@@ -345,17 +382,17 @@ public class Bot extends TelegramLongPollingBot {
     /** Сообщение с HTML-разметкой: всё динамическое должно быть экранировано через {@link Html}. */
     private void sendHtml(long chatId, String html) {
         send(SendMessage.builder()
-                .chatId(String.valueOf(chatId))
+                .chatId(chatId)
                 .text(html)
                 .parseMode("HTML")
                 .build());
     }
 
-    private synchronized void send(SendMessage sendMessage) {
+    private void send(SendMessage sendMessage) {
         try {
-            execute(sendMessage);
+            telegramClient.execute(sendMessage);
         } catch (TelegramApiException e) {
-            e.printStackTrace();
+            log.warn("Не удалось отправить сообщение в чат {}", sendMessage.getChatId(), e);
         }
     }
 
@@ -374,11 +411,6 @@ public class Bot extends TelegramLongPollingBot {
 
     /** «Сегодня» в часовом поясе бота (BOT_TIMEZONE), а не сервера. */
     private LocalDate today() {
-        return LocalDate.now(config.zoneId);
-    }
-
-    @Override
-    public String getBotUsername() {
-        return config.botUsername;
+        return LocalDate.now(clock);
     }
 }

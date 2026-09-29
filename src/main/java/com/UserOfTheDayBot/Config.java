@@ -1,5 +1,8 @@
 package com.UserOfTheDayBot;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -14,7 +17,9 @@ import java.util.Properties;
  */
 public class Config {
 
-    public final String botUsername;
+    private static final Logger log = LoggerFactory.getLogger(Config.class);
+
+    public final String botUsername;   // необязателен: если пуст, берётся из getMe
     public final String botToken;
     public final String dbUrl;     // jdbc:sqlite:bot.db
     public final ZoneId zoneId;
@@ -25,7 +30,7 @@ public class Config {
         try (InputStream in = new FileInputStream(path)) {
             props.load(in);
         } catch (IOException e) {
-            System.out.println("Файл " + path + " не найден, читаю только переменные окружения.");
+            log.info("Файл {} не найден, читаю только переменные окружения.", path);
         }
 
         this.botUsername = pick(props, "bot.username", "BOT_USERNAME", "");
@@ -33,9 +38,9 @@ public class Config {
         this.dbUrl       = pick(props, "db.url",       "DB_URL",       "jdbc:sqlite:bot.db");
         this.zoneId      = ZoneId.of(pick(props, "bot.timezone", "BOT_TIMEZONE", "Europe/Prague"));
 
-        if (botToken.isBlank() || botUsername.isBlank()) {
+        if (botToken.isBlank()) {
             throw new IllegalStateException(
-                    "Не заданы bot.token / bot.username. Заполни config.properties (см. config.example.properties).");
+                    "Не задан bot.token / BOT_TOKEN. Заполни config.properties (см. config.example.properties) или .env.");
         }
     }
 

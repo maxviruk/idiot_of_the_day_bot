@@ -3,6 +3,8 @@ package com.UserOfTheDayBot;
 import com.UserOfTheDayBot.enums.Games;
 import com.UserOfTheDayBot.exceptions.ExistedUserException;
 import com.UserOfTheDayBot.model.HistoryEntry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.telegram.telegrambots.meta.api.objects.User;
 
 import java.sql.*;
@@ -27,6 +29,8 @@ public class DBHandler {
 
     /** Текущая версия схемы. Увеличивать при добавлении миграции в {@link #migrate()}. */
     static final int SCHEMA_VERSION = 1;
+
+    private static final Logger log = LoggerFactory.getLogger(DBHandler.class);
 
     private final Connection connection;
 
@@ -110,7 +114,7 @@ public class DBHandler {
                 connection.close();
             }
         } catch (SQLException e) {
-            e.printStackTrace();
+            log.error("Ошибка работы с базой", e);
         }
     }
 
@@ -128,7 +132,7 @@ public class DBHandler {
                 return rs.next();
             }
         } catch (SQLException e) {
-            e.printStackTrace();
+            log.error("Ошибка работы с базой", e);
         }
         return false;
     }
@@ -154,7 +158,7 @@ public class DBHandler {
                 }
             });
         } catch (SQLException e) {
-            e.printStackTrace();
+            log.error("Ошибка работы с базой", e);
         }
     }
 
@@ -169,7 +173,7 @@ public class DBHandler {
             ps.setLong(2, userId);
             return ps.executeUpdate() > 0;
         } catch (SQLException e) {
-            e.printStackTrace();
+            log.error("Ошибка работы с базой", e);
         }
         return false;
     }
@@ -189,7 +193,7 @@ public class DBHandler {
             ps.setString(5, user.getFirstName());
             ps.executeUpdate();
         } catch (SQLException e) {
-            e.printStackTrace();
+            log.error("Ошибка работы с базой", e);
         }
     }
 
@@ -228,7 +232,7 @@ public class DBHandler {
                 }
             });
         } catch (SQLException e) {
-            e.printStackTrace();
+            log.error("Ошибка работы с базой", e);
         }
     }
 
@@ -253,7 +257,7 @@ public class DBHandler {
                 }
             }
         } catch (SQLException e) {
-            e.printStackTrace();
+            log.error("Ошибка работы с базой", e);
         }
         return players;
     }
@@ -280,7 +284,7 @@ public class DBHandler {
                 }
             }
         } catch (SQLException e) {
-            e.printStackTrace();
+            log.error("Ошибка работы с базой", e);
         }
         return null;
     }
@@ -312,7 +316,7 @@ public class DBHandler {
                 }
             });
         } catch (SQLException e) {
-            e.printStackTrace();
+            log.error("Ошибка работы с базой", e);
         }
     }
 
@@ -350,7 +354,7 @@ public class DBHandler {
                 }
             }
         } catch (SQLException e) {
-            e.printStackTrace();
+            log.error("Ошибка работы с базой", e);
         }
         return result;
     }
@@ -374,7 +378,7 @@ public class DBHandler {
                 }
             });
         } catch (SQLException e) {
-            e.printStackTrace();
+            log.error("Ошибка работы с базой", e);
         }
     }
 

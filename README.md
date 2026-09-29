@@ -16,7 +16,7 @@
 
 ### Прочие улучшения
 - **SQLite вместо MySQL** — вся база в одном файле (`bot.db`), отдельный сервер не нужен, таблицы создаются сами.
-- Новый Telegram Bot API (6.8.0), без устаревшего `ApiContextInitializer`.
+- Java 21 и актуальная библиотека TelegramBots 10.x (`telegrambots-longpolling` + `telegrambots-client`).
 - Токен вынесен в `config.properties` / переменные окружения (раньше был в коде).
 - Устойчивость к не-текстовым сообщениям и неизвестным командам (раньше бот падал).
 - Исправлен баг с определением «сегодня» (был формат `"DD"` — день года вместо дня месяца).
@@ -47,7 +47,7 @@
    cp config.example.properties config.properties
    ```
 
-2. **Сборка:**
+2. **Сборка** (нужны JDK 21 и Maven; тесты запускаются автоматически):
    ```bash
    mvn clean package
    ```
@@ -72,6 +72,11 @@
 это разовая выгрузка из MySQL и заливка в SQLite (движки разные, простым SQL-скриптом
 не обойтись). Напишите — подготовлю скрипт конвертации под вашу старую базу.
 
+## Тесты и CI
+`mvn verify` гоняет юнит-тесты (база — SQLite в памяти, Telegram подменён фейковым клиентом).
+GitHub Actions (`.github/workflows/ci.yml`) на каждый push в `main` и PR собирает проект,
+прогоняет тесты и проверяет сборку Docker-образа.
+
 ## Структура
 ```
 pom.xml
@@ -79,6 +84,8 @@ config.example.properties
 sql/schema.sql            # справочник по структуре (бот создаёт таблицы сам)
 src/main/java/com/UserOfTheDayBot/
   Main.java      Bot.java       DBHandler.java
-  Config.java    UserForBD.java
+  Config.java    UserForBD.java Html.java
   enums/         exceptions/    model/HistoryEntry.java
+src/test/java/com/UserOfTheDayBot/   # тесты
+.github/workflows/ci.yml             # CI
 ```
