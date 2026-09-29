@@ -3,6 +3,7 @@ package com.UserOfTheDayBot;
 import com.UserOfTheDayBot.enums.Games;
 import com.UserOfTheDayBot.exceptions.ExistedUserException;
 import com.UserOfTheDayBot.model.HistoryEntry;
+import com.UserOfTheDayBot.model.WinCount;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -152,5 +153,40 @@ class DBHandlerTest {
              ResultSet rs = st.executeQuery("PRAGMA user_version")) {
             assertEquals(DBHandler.SCHEMA_VERSION, rs.getInt(1));
         }
+    }
+
+    @Test
+    void winCountsForPeriod() throws Exception {
+        db.registration(CHAT, user(1, "Bob", "bob"));
+        db.registration(CHAT, user(2, "Ann", null));
+        db.saveWinner(CHAT, player(1), LocalDate.of(2026, 8, 31), Games.user_of_the_day);
+        db.saveWinner(CHAT, player(2), LocalDate.of(2026, 9, 1), Games.user_of_the_day);
+        db.saveWinner(CHAT, player(2), LocalDate.of(2026, 9, 2), Games.user_of_the_day);
+        db.saveWinner(CHAT, player(1), LocalDate.of(2026, 9, 3), Games.loser_of_the_day);
+
+        List<WinCount> september = db.getWinCounts(CHAT, Games.user_of_the_day, LocalDate.of(2026, 9, 1));
+        assertEquals(List.of(new WinCount(2, "Ann", 2)), september);
+        assertEquals(2, db.getWinCounts(CHAT, Games.user_of_the_day, LocalDate.of(2026, 1, 1)).size());
+        assertEquals(3, db.getTimeline(CHAT, Games.user_of_the_day).size());
+    }
+
+    @Test
+    void autoTime() {
+        assertNull(db.getAutoTime(CHAT));
+        db.setAutoTime(CHAT, "10:00");
+        assertEquals("10:00", db.getAutoTime(CHAT));
+        assertTrue(db.getChatsWithAutoTimeReached("09:59").isEmpty());
+        assertEquals(List.of(CHAT), db.getChatsWithAutoTimeReached("10:00"));
+        assertEquals(List.of(CHAT), db.getChatsWithAutoTimeReached("23:00"));
+        db.setAutoTime(CHAT, null);
+        assertTrue(db.getChatsWithAutoTimeReached("23:00").isEmpty());
+    }
+
+    @Test
+    void findPlayerIncludesPlayersWhoLeft() throws Exception {
+        db.registration(CHAT, user(1, "Bob", "bob"));
+        db.unregister(CHAT, 1);
+        assertTrue(db.findPlayer(CHAT, 1).isPresent());
+        assertTrue(db.findPlayer(CHAT, 2).isEmpty());
     }
 }

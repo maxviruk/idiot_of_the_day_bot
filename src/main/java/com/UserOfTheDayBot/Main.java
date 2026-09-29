@@ -27,6 +27,7 @@ public class Main {
 
         Bot bot = new Bot(telegramClient, dbHandler, username, Clock.system(config.zoneId), MESSAGE_DELAY_MS);
         bot.registerCommands();
+        bot.startAutoDraws();
 
         TelegramBotsLongPollingApplication app = new TelegramBotsLongPollingApplication();
         // Корректное завершение по docker stop / Ctrl+C: перестаём получать апдейты,

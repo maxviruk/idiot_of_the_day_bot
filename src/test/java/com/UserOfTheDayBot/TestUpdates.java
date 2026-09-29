@@ -1,5 +1,6 @@
 package com.UserOfTheDayBot;
 
+import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.User;
 import org.telegram.telegrambots.meta.api.objects.chat.Chat;
@@ -36,5 +37,20 @@ final class TestUpdates {
 
     static Update text(long chatId, User from, String text) {
         return update(message(chatId, from, text));
+    }
+
+    static Update callback(long chatId, User from, String data) {
+        Message origin = new Message();
+        origin.setChat(new Chat(chatId, chatId > 0 ? "private" : "supergroup"));
+        origin.setMessageId(77);
+        CallbackQuery q = new CallbackQuery();
+        q.setId("cb" + updateId);
+        q.setFrom(from);
+        q.setMessage(origin);
+        q.setData(data);
+        Update u = new Update();
+        u.setUpdateId(updateId++);
+        u.setCallbackQuery(q);
+        return u;
     }
 }

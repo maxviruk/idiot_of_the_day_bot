@@ -3,6 +3,8 @@ package com.UserOfTheDayBot;
 import com.UserOfTheDayBot.enums.Games;
 import com.UserOfTheDayBot.exceptions.ExistedUserException;
 import com.UserOfTheDayBot.model.HistoryEntry;
+import com.UserOfTheDayBot.model.Win;
+import com.UserOfTheDayBot.model.WinCount;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.telegram.telegrambots.meta.api.objects.User;
@@ -11,6 +13,7 @@ import java.sql.*;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Работа с SQLite.
@@ -28,7 +31,7 @@ import java.util.List;
 public class DBHandler {
 
     /** Текущая версия схемы. Увеличивать при добавлении миграции в {@link #migrate()}. */
-    static final int SCHEMA_VERSION = 1;
+    static final int SCHEMA_VERSION = 2;
 
     private static final Logger log = LoggerFactory.getLogger(DBHandler.class);
 
@@ -103,6 +106,15 @@ public class DBHandler {
                     // Выход из игры больше не удаляет строку со счётчиками — только снимает флаг.
                     st.execute("ALTER TABLE chat_user ADD COLUMN active INTEGER NOT NULL DEFAULT 1");
                     st.execute("PRAGMA user_version = 1");
+                }
+            });
+        }
+        if (version < 2) {
+            inTransaction(() -> {
+                try (Statement st = connection.createStatement()) {
+                    // время ежедневного авторозыгрыша (HH:mm в часовом поясе бота), NULL = выключен
+                    st.execute("ALTER TABLE chats ADD COLUMN auto_time TEXT");
+                    st.execute("PRAGMA user_version = 2");
                 }
             });
         }
@@ -351,6 +363,134 @@ public class DBHandler {
                             ? rs.getString(3)
                             : new UserForBD(0, username, firstname).getDisplayName();
                     result.add(new HistoryEntry(LocalDate.parse(rs.getString(1)), rs.getString(2), name));
+                }
+            }
+        } catch (SQLException e) {
+            log.error("Ошибка работы с базой", e);
+        }
+        return result;
+    }
+
+    // ---------------------------------------------------------------------
+    // Статистика за период, серии, личная статистика
+    // ---------------------------------------------------------------------
+
+    /** Сколько раз каждый выигрывал игру начиная с {@code from} (включительно), по убыванию. */
+    public synchronized List<WinCount> getWinCounts(long chatId, Games game, LocalDate from) {
+        List<WinCount> result = new ArrayList<>();
+        String sql = "SELECT h.winner_user_id, u.username, u.firstname, MAX(h.winner_name), COUNT(*) AS cnt " +
+                     "FROM history h LEFT JOIN users u ON u.user_id = h.winner_user_id " +
+                     "WHERE h.chat_id = ? AND h.game = ? AND h.run_date >= ? " +
+                     "GROUP BY h.winner_user_id ORDER BY cnt DESC, MAX(h.run_date) ASC";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setLong(1, chatId);
+            ps.setString(2, game.name());
+            ps.setString(3, from.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String username = rs.getString(2);
+                    String firstname = rs.getString(3);
+                    String name = (username == null && firstname == null)
+                            ? rs.getString(4)
+                            : new UserForBD(0, username, firstname).getDisplayName();
+                    result.add(new WinCount(rs.getLong(1), name, rs.getInt(5)));
+                }
+            }
+        } catch (SQLException e) {
+            log.error("Ошибка работы с базой", e);
+        }
+        return result;
+    }
+
+    /** Все победы в игре по порядку (старые -> новые) — для подсчёта серий. */
+    public synchronized List<Win> getTimeline(long chatId, Games game) {
+        List<Win> result = new ArrayList<>();
+        String sql = "SELECT run_date, winner_user_id FROM history " +
+                     "WHERE chat_id = ? AND game = ? ORDER BY run_date ASC, id ASC";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setLong(1, chatId);
+            ps.setString(2, game.name());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    result.add(new Win(LocalDate.parse(rs.getString(1)), rs.getLong(2)));
+                }
+            }
+        } catch (SQLException e) {
+            log.error("Ошибка работы с базой", e);
+        }
+        return result;
+    }
+
+    /**
+     * Игрок чата со счётчиками — в том числе вышедший из игры (для /me).
+     * Пусто, если пользователь никогда не регистрировался в этом чате.
+     */
+    public synchronized Optional<UserForBD> findPlayer(long chatId, long userId) {
+        String sql = "SELECT u.user_id, u.username, u.firstname, cu.user_day_counter, cu.loser_counter " +
+                     "FROM users u JOIN chat_user cu ON cu.user_id = u.user_id " +
+                     "WHERE cu.chat_id = ? AND cu.user_id = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setLong(1, chatId);
+            ps.setLong(2, userId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    UserForBD u = new UserForBD(rs.getLong(1), rs.getString(2), rs.getString(3));
+                    u.setUserDayCounter(rs.getInt(4));
+                    u.setLoserDayCounter(rs.getInt(5));
+                    return Optional.of(u);
+                }
+            }
+        } catch (SQLException e) {
+            log.error("Ошибка работы с базой", e);
+        }
+        return Optional.empty();
+    }
+
+    // ---------------------------------------------------------------------
+    // Авторозыгрыш по расписанию
+    // ---------------------------------------------------------------------
+
+    /** Включает авторозыгрыш в {@code time} (формат HH:mm) или выключает, если null. */
+    public synchronized void setAutoTime(long chatId, String time) {
+        try {
+            inTransaction(() -> {
+                ensureChat(chatId);
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "UPDATE chats SET auto_time = ? WHERE chat_id = ?")) {
+                    ps.setString(1, time);
+                    ps.setLong(2, chatId);
+                    ps.executeUpdate();
+                }
+            });
+        } catch (SQLException e) {
+            log.error("Ошибка работы с базой", e);
+        }
+    }
+
+    /** Время авторозыгрыша (HH:mm) или null, если выключен. */
+    public synchronized String getAutoTime(long chatId) {
+        try (PreparedStatement ps = connection.prepareStatement("SELECT auto_time FROM chats WHERE chat_id = ?")) {
+            ps.setLong(1, chatId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getString(1);
+                }
+            }
+        } catch (SQLException e) {
+            log.error("Ошибка работы с базой", e);
+        }
+        return null;
+    }
+
+    /** Чаты, у которых время авторозыгрыша уже наступило ({@code now} — HH:mm). */
+    public synchronized List<Long> getChatsWithAutoTimeReached(String now) {
+        List<Long> result = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT chat_id FROM chats WHERE auto_time IS NOT NULL AND auto_time <= ?")) {
+            ps.setString(1, now);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    result.add(rs.getLong(1));
                 }
             }
         } catch (SQLException e) {

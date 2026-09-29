@@ -13,7 +13,7 @@ PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 -- Версия схемы. Бот сам применяет миграции к старым базам (DBHandler.migrate()).
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 -- Чаты, где работает бот.
 -- Колонки user_of_the_day* / loser_of_the_day* устарели: победитель дня и факт
@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS chats (
     user_of_the_day          TEXT,
     loser_of_the_day         TEXT,
     user_of_the_day_run_day  INTEGER,
-    loser_of_the_day_run_day INTEGER
+    loser_of_the_day_run_day INTEGER,
+    auto_time                TEXT       -- время авторозыгрыша HH:mm (часовой пояс бота), NULL = выключен
 );
 
 -- Пользователи (глобально). INTEGER в SQLite 64-битный — Telegram id влезает.
