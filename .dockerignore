@@ -1,0 +1,8 @@
+target/
+.git/
+.idea/
+*.iml
+config.properties
+bot.db
+*.db
+.env

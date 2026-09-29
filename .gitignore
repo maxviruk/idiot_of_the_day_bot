@@ -1,0 +1,14 @@
+target/
+*.class
+*.iml
+.idea/
+.vscode/
+
+# секреты — не коммитим
+config.properties
+
+# docker secrets
+.env
+bot.db
+*.db
+dependency-reduced-pom.xml
